@@ -1,10 +1,10 @@
-# Sunmi ePOS Interceptor
+# SUNMI Store Commerce Printer Bridge Service
 
 A robust background print server built with Flutter designed to intercept, parse, and print EPSON XML (ePOS-Print) payloads natively on Sunmi POS hardware.
 
 ## Overview
 
-The **Sunmi ePOS Interceptor** acts as a middleware bridge for modern web-based Point of Sale (POS) systems that expect to communicate with EPSON network printers. Instead of requiring expensive external hardware, this application runs silently in the background of a Sunmi device, listening on the standard EPSON print port (`9100`).
+The **SUNMI Store Commerce Printer Bridge Service** acts as a middleware bridge for modern web-based Point of Sale (POS) systems that expect to communicate with EPSON network printers. Instead of requiring expensive external hardware, this application runs silently in the background of a Sunmi device, listening on the standard EPSON print port (`9100`).
 
 When an ePOS XML payload is received, the interceptor parses the raw data, extracts the receipt information (including dynamically decoding Base64 images), formats it for the narrow thermal paper format, and dispatches the job directly to the built-in Sunmi printer.
 
