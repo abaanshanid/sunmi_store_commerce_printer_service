@@ -31,6 +31,7 @@ void logToConsole(String message) {
 class ParsedReceipt {
   String headerText = 'STORE NAME\nاسم المتجر';
   String printDateTime = 'N/A';
+  String transactionDateTime = 'N/A';
   String store = 'N/A';
   String salesEmp = 'N/A';
   String cashier = 'Administrator';
@@ -107,7 +108,6 @@ void onStart(ServiceInstance service) async {
       if (request.method == 'POST') {
         try {
           final payload = await utf8.decoder.bind(request).join();
-          await processPayload(payload);
 
           request.response
             ..statusCode = HttpStatus.ok
@@ -115,11 +115,16 @@ void onStart(ServiceInstance service) async {
             ..write(
               '<?xml version="1.0" encoding="utf-8"?><response success="true" code="SUCCESS" status="0"/>',
             );
+          await request.response.close();
+
+          await processPayload(payload);
+
         } catch (e) {
           logToConsole("ERROR processing payload: $e");
-          request.response.statusCode = HttpStatus.internalServerError;
-        } finally {
-          await request.response.close();
+          try {
+            request.response.statusCode = HttpStatus.internalServerError;
+            await request.response.close();
+          } catch (_) {}
         }
       } else {
         request.response
@@ -140,11 +145,20 @@ void onStart(ServiceInstance service) async {
 }
 
 // ==========================================
-// 3. TOP-LEVEL LOGIC
+// 3. TOP-LEVEL LOGIC (PARSING & ROUTING)
 // ==========================================
 Future<void> processPayload(String xmlSource) async {
   ParsedReceipt receipt = await parseXmlToReceipt(xmlSource);
-  await printReceipt(receipt);
+
+  // If parsing yielded completely empty item lists and the receipt No is default,
+  // it is likely an unrecognized format. Fallback to raw ePOS printing.
+  if (receipt.items.isEmpty && receipt.receiptNo == 'N/A') {
+    logToConsole("Unknown POS format detected. Using Raw Basic Text Fallback.");
+    await printRawEposXml(xmlSource);
+  } else {
+    logToConsole("Known POS format detected. Using Structured UI.");
+    await printReceipt(receipt);
+  }
 }
 
 Future<ParsedReceipt> parseXmlToReceipt(String xmlSource) async {
@@ -192,12 +206,20 @@ Future<ParsedReceipt> parseXmlToReceipt(String xmlSource) async {
     }
 
     String singleLineText = fullText.replaceAll('\n', ' ');
-    var dateMatch = RegExp(
+    var dateMatches = RegExp(
         r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+(\d{1,2}:\d{2}(?::\d{2})?\s*[A-Za-z]{2})')
-        .firstMatch(singleLineText);
-    if (dateMatch != null) {
+        .allMatches(singleLineText).toList();
+
+    if (dateMatches.isNotEmpty) {
       receipt.printDateTime =
-          "${dateMatch.group(1)} ${dateMatch.group(2)}".trim();
+          "${dateMatches.first.group(1)} ${dateMatches.first.group(2)}".trim();
+
+      if (dateMatches.length > 1) {
+        receipt.transactionDateTime =
+            "${dateMatches[1].group(1)} ${dateMatches[1].group(2)}".trim();
+      } else {
+        receipt.transactionDateTime = receipt.printDateTime;
+      }
     }
 
     for (String line in lines) {
@@ -387,6 +409,9 @@ Future<ParsedReceipt> parseXmlToReceipt(String xmlSource) async {
   return receipt;
 }
 
+// ==========================================
+// 4. IMAGE UTILS
+// ==========================================
 Uint8List? receiptImageAt(List<Uint8List> images, int index) {
   return index < images.length ? images[index] : null;
 }
@@ -492,6 +517,95 @@ Future<void> printReceiptImage(
   if (tightTop) await SunmiPrinter.printEscPos(const [0x1B, 0x32]);
 }
 
+// ==========================================
+// 5. HARDWARE PRINTING COMMANDS
+// ==========================================
+
+// -> RAW FALLBACK PRINTER (For Unknown ePOS XML formats)
+Future<void> printRawEposXml(String xmlSource) async {
+  try {
+    await SunmiPrinter.initPrinter();
+
+    final document = XmlDocument.parse(xmlSource);
+    final eposPrint = document.findAllElements('epos-print').firstOrNull;
+    if (eposPrint == null) return;
+
+    for (final element in eposPrint.children) {
+      if (element is! XmlElement) continue;
+      final tag = element.name.local.toLowerCase();
+
+      if (tag == 'text') {
+        String text = element.innerText;
+        // Handle standalone newlines
+        if (text == '\n' || text == '&#10;') {
+          await SunmiPrinter.lineWrap(1);
+          continue;
+        }
+        if (text.trim().isEmpty) continue; // Skip random empty space blocks
+
+        // Respect XML alignment attributes
+        final align = element.getAttribute('align');
+        if (align == 'center') {
+          await SunmiPrinter.setAlignment(SunmiPrintAlign.CENTER);
+        } else if (align == 'right') {
+          await SunmiPrinter.setAlignment(SunmiPrintAlign.RIGHT);
+        } else {
+          await SunmiPrinter.setAlignment(SunmiPrintAlign.LEFT);
+        }
+
+        // Respect XML Font Scale Attributes to prevent Line Wrapping
+        // Standard EPSON formatting heavily uses 'font_b' to fit 48 characters width.
+        final fontName = element.getAttribute('font');
+        int fontSize = 20; // Default safe font size
+
+        if (fontName == 'font_b') {
+          fontSize = 20; // Smallest clear font size to avoid 48-char overflow
+        }
+
+        // If the XML explicitly requires double width/height, respect it
+        if (element.getAttribute('width') == '2' || element.getAttribute('height') == '2') {
+          fontSize = 28;
+        }
+
+        // Respect Bold attributes
+        final isBold = element.getAttribute('em') == 'true';
+
+        // Print the extracted text (trimming trailing newlines to prevent double wraps)
+        await SunmiPrinter.printText(text.trimRight(), style: SunmiTextStyle(bold: isBold, fontSize: fontSize));
+
+      } else if (tag == 'image') {
+        Uint8List? decodedImg = await renderEposImagePng(element, onLog: logToConsole);
+        if (decodedImg != null) {
+          await printReceiptImage(decodedImg);
+        }
+      } else if (tag == 'barcode') {
+        String barcode = element.innerText.trim();
+        if (barcode.isNotEmpty) {
+          await SunmiPrinter.setAlignment(SunmiPrintAlign.CENTER);
+          await SunmiPrinter.printBarCode(
+            barcode,
+            style: SunmiBarcodeStyle(
+              type: SunmiBarcodeType.CODE128,
+              height: 64,
+              size: 2,
+              textPos: SunmiBarcodeTextPos.TEXT_UNDER,
+            ),
+          );
+        }
+      } else if (tag == 'feed') {
+        await SunmiPrinter.lineWrap(1);
+      } else if (tag == 'cut') {
+        await SunmiPrinter.lineWrap(3);
+      }
+    }
+
+    await SunmiPrinter.lineWrap(4); // Extra spacing at the very end
+  } catch (e) {
+    logToConsole("Raw Fallback Print Error: $e");
+  }
+}
+
+// -> STRUCTURED UI PRINTER (For Known Sport Store Format)
 Future<void> printCompactHeaderText(String headerText) async {
   final headerStyle = SunmiTextStyle(
     bold: true,
@@ -546,7 +660,7 @@ Future<void> printReceipt(ParsedReceipt r) async {
     await SunmiPrinter.printRow(
       cols: [
         SunmiColumn(
-          text: r.printDateTime,
+          text: r.transactionDateTime,
           width: 16,
           style: SunmiTextStyle(align: SunmiPrintAlign.LEFT),
         ),
@@ -791,7 +905,7 @@ Future<void> printReceipt(ParsedReceipt r) async {
 }
 
 // ==========================================
-// 4. MAIN APP ENTRY
+// 6. MAIN APP ENTRY & PERMISSIONS
 // ==========================================
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -812,14 +926,11 @@ class SunmiBridgeApp extends StatelessWidget {
         primarySwatch: Colors.amber,
         scaffoldBackgroundColor: const Color(0xFF121212),
       ),
-      home: const PermissionsScreen(), // ENTRY POINT
+      home: const PermissionsScreen(),
     );
   }
 }
 
-// ==========================================
-// 5. PERMISSIONS SCREEN
-// ==========================================
 class PermissionsScreen extends StatefulWidget {
   const PermissionsScreen({Key? key}) : super(key: key);
 
@@ -836,7 +947,7 @@ class _PermissionsScreenState extends State<PermissionsScreen>
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this); // Listen for return from settings
+    WidgetsBinding.instance.addObserver(this);
     _checkAllPermissions();
   }
 
@@ -846,7 +957,6 @@ class _PermissionsScreenState extends State<PermissionsScreen>
     super.dispose();
   }
 
-  // Triggers automatically when app is resumed (e.g., returning from Android Settings)
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
@@ -863,7 +973,6 @@ class _PermissionsScreenState extends State<PermissionsScreen>
 
     setState(() => _isChecking = false);
 
-    // If both are granted, automatically navigate to the main dashboard
     if (_isOverlayGranted && _isBatteryOptimizationsIgnored) {
       if (!mounted) return;
       Navigator.pushReplacement(
@@ -915,8 +1024,6 @@ class _PermissionsScreenState extends State<PermissionsScreen>
               style: TextStyle(fontSize: 16, color: Colors.white70),
             ),
             const SizedBox(height: 32),
-
-            // Overlay Permission Card
             _buildPermissionCard(
               title: "Draw Over Other Apps",
               description:
@@ -926,8 +1033,6 @@ class _PermissionsScreenState extends State<PermissionsScreen>
               onRequest: _requestOverlay,
             ),
             const SizedBox(height: 16),
-
-            // Battery Optimization Card
             _buildPermissionCard(
               title: "Ignore Battery Optimization",
               description:
@@ -936,7 +1041,6 @@ class _PermissionsScreenState extends State<PermissionsScreen>
               isGranted: _isBatteryOptimizationsIgnored,
               onRequest: _requestBattery,
             ),
-
             const Spacer(),
             SizedBox(
               width: double.infinity,
@@ -951,7 +1055,7 @@ class _PermissionsScreenState extends State<PermissionsScreen>
                     const BridgeDashboard(),
                   ),
                 )
-                    : null, // Disabled if not fully granted
+                    : null,
                 style: ElevatedButton.styleFrom(
                   backgroundColor: Colors.amber,
                   foregroundColor: Colors.black,
@@ -1032,7 +1136,7 @@ class _PermissionsScreenState extends State<PermissionsScreen>
 }
 
 // ==========================================
-// 6. UI DASHBOARD
+// 7. UI DASHBOARD
 // ==========================================
 class BridgeDashboard extends StatefulWidget {
   const BridgeDashboard({Key? key}) : super(key: key);
@@ -1049,7 +1153,7 @@ class _BridgeDashboardState extends State<BridgeDashboard>
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this); // Listen for app backgrounding
+    WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _fetchLocalIp();
       _checkServiceStatus();
@@ -1062,14 +1166,10 @@ class _BridgeDashboardState extends State<BridgeDashboard>
     super.dispose();
   }
 
-  // NOTE: This triggers ONLY when the user is already on the dashboard and leaves the app.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
       if (_isServerRunning) {
-        // A slight delay prevents the pop from crashing the native Android transition animation.
-        // Combined with android:excludeFromRecents="true" in the Manifest,
-        // this will completely destroy the UI from RAM and hide it from the square button menu.
         Future.delayed(const Duration(milliseconds: 500), () {
           SystemNavigator.pop();
         });
@@ -1122,7 +1222,6 @@ class _BridgeDashboardState extends State<BridgeDashboard>
       setState(() {
         _isServerRunning = true;
       });
-      // Allow time for isolate to spin up and bind
       Future.delayed(const Duration(seconds: 1), _checkServiceStatus);
     }
   }
